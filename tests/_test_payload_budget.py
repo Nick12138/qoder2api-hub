@@ -140,6 +140,53 @@ finally:
     P.PAYLOAD_CAP_BYTES = old_cap
 
 
+# ---- 6) 与上游 #59 合并后的开关语义（两道门共存） ----
+_pay = {"model": "auto", "stream": False, "messages": [
+    {"role": "user", "content": [
+        {"type": "text", "text": "hi"},
+        {"type": "image_url", "image_url": {"url": data_url(0.01)}}]}]}
+
+
+def _built(env_compat=None, legacy=None):
+    """按指定环境变量（其余清空）构造一次上游请求体。"""
+    keys = ("QD_IMAGE_COMPAT_FIELDS", "QD_KEEP_TOPLEVEL_IMAGES")
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        if env_compat is not None:
+            os.environ["QD_IMAGE_COMPAT_FIELDS"] = env_compat
+        if legacy is not None:
+            os.environ["QD_KEEP_TOPLEVEL_IMAGES"] = legacy
+        return P.build_qoder_body(_pay, None, "auto", realm="cn")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+b = _built()
+check("默认两份顶层图片都不填（上游 #59）",
+      not b.get("image_urls")
+      and not (b.get("chat_context") or {}).get("imageUrls"))
+b = _built("context")
+check("QD_IMAGE_COMPAT_FIELDS=context 只填 chat_context",
+      not b.get("image_urls")
+      and bool((b.get("chat_context") or {}).get("imageUrls")))
+b = _built("both")
+check("QD_IMAGE_COMPAT_FIELDS=both 两份都填", bool(b.get("image_urls")))
+b = _built(None, "1")
+check("旧开关 QD_KEEP_TOPLEVEL_IMAGES=1 等价 both（运行时生效）",
+      bool(b.get("image_urls")))
+b = _built("none", "1")
+check("显式 QD_IMAGE_COMPAT_FIELDS=none 优先于旧开关",
+      not b.get("image_urls"))
+check("裁剪 cap 不高于上游硬限（先裁后 413，不互相遮挡）",
+      P.PAYLOAD_CAP_BYTES <= P.MAX_UPSTREAM_BODY_BYTES,
+      "%d > %d" % (P.PAYLOAD_CAP_BYTES, P.MAX_UPSTREAM_BODY_BYTES))
+
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, 0 skipped"
       % (PASS + FAIL, PASS, FAIL))
