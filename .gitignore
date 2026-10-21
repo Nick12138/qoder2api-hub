@@ -15,6 +15,12 @@ __pycache__/
 .mimosa/
 .team/
 
+# 运行时 pid 文件（start/stop 脚本自动生成）
+*.pid
+
+# 诊断抓包：QD_DUMP_ON_TRANSPORT=1 时落盘，单个请求体可达数十 MB
+transport-dumps/
+
 # ---- 自动提取的原生组件（体积大、平台相关，由 _install_umid.py 生成）----
 umid/
 _shots/

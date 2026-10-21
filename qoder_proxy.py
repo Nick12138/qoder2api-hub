@@ -34,6 +34,7 @@ import json
 import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("QD_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
 import ipaddress
+import io
 import socket
 import ssl
 import sys
@@ -4684,6 +4685,182 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
     return system_text, flat, images
 
 
+# 图片字段兼容开关（见 build_qoder_body 里的注释）：none/context/both。
+IMAGE_COMPAT_FIELDS = (os.environ.get("QD_IMAGE_COMPAT_FIELDS")
+                       or "none").strip().lower()
+
+# 上游网关的请求体软上限（实测：encoded 27MB 能过，32MB 必断连）。
+# 现在真正的防线是下面的 enforce_payload_budget（超线会裁/拒），这个告警
+# 只在需要“先看一眼体积”时开：QD_PAYLOAD_WARN_MB，默认 0 = 关。
+PAYLOAD_WARN_BYTES = int(os.environ.get("QD_PAYLOAD_WARN_MB", "0") or 0) \
+    * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# 出站体积闸门（防上游 ~30MB body 上限）
+# ---------------------------------------------------------------------------
+# 实测上游网关：encoded 后 27MB 能过，32MB 直接被**掉线**（客户端 WinError
+# 10053 / 服务端 SSL_ERROR_SYSCALL），不回 413、不回任何 JSON，所以客户端只能
+# 看到“网络错误”、重试永远失败。带图的会话很容撞上：一批图会被写进
+# messages 的 image_url parts（每轮全量重发），累积几次就超过 30MB。
+#
+# 闸门策略（只在**超过线**时生效，不超线时一根字节都不动）：
+#   ① 从最老的图片开始丢，保留最近 QD_PAYLOAD_KEEP_IMAGES 张（默认 1）；
+#   ② 还不够 -> 把最大的文本块（工具结果/长消息）按 _shrink_tool_result 压短；
+#   ③ 还不够 -> 直接回 413 + 清楚的原因，而不是傻等 3 次重试后回 502。
+# 关卡值 QD_PAYLOAD_CAP_MB 默认 24（距实测硬限留 6-8MB 余量）；设 0 = 关闭。
+PAYLOAD_CAP_BYTES = int(os.environ.get("QD_PAYLOAD_CAP_MB", "24") or 24) \
+    * 1024 * 1024
+PAYLOAD_KEEP_IMAGES = int(os.environ.get("QD_PAYLOAD_KEEP_IMAGES", "1") or 0)
+PAYLOAD_TEXT_KEEP_STEPS = (600, 200)   # 文本块逐步压短的保留字符数（单侧）
+PAYLOAD_TOO_LARGE_PREFIX = "payload-too-large: "
+
+
+def _encoded_len(body):
+    """qoder_encode 后的字符数；不必真的编码（= base64 变体的 4*ceil(n/3)）。"""
+    n = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    return 4 * ((n + 2) // 3)
+
+
+def _iter_image_parts(body):
+    """按时间顺序产出 (消息下标, part 下标, data URL 字符数)。"""
+    for mi, msg in enumerate(body.get("messages") or []):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for pi, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            yield mi, pi, len(url or "")
+
+
+def _shrink_text_blocks(body, keep, budget):
+    """把最大的文本块压到 keep 字符（首尾保留），直到省够 budget 字符。
+
+    “最大优先”是因为日志/工具回显的长度分布极端右偏：压住头几条就够了。
+    返回 (改动条数, 节省字符数)。
+    """
+    targets = []
+    for mi, msg in enumerate(body.get("messages") or []):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            targets.append((len(content), mi, None))
+        elif isinstance(content, list):
+            for pi, part in enumerate(content):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text") or ""
+                    targets.append((len(text), mi, pi))
+    targets.sort(key=lambda t: -t[0])
+    touched = 0
+    saved = 0
+    for size, mi, pi in targets:
+        if saved >= budget:
+            break
+        msg = body["messages"][mi]
+        if pi is None:
+            old = msg.get("content")
+            new = _shrink_tool_result(old, keep)
+            if new == old:
+                continue
+            msg["content"] = new
+        else:
+            part = msg["content"][pi]
+            old = part.get("text") or ""
+            new = _shrink_tool_result(old, keep)
+            if new == old:
+                continue
+            part["text"] = new
+        saved += max(0, size - len(new))
+        touched += 1
+    return touched, saved
+
+
+def enforce_payload_budget(body, model=""):
+    """把出站请求体压到 PAYLOAD_CAP_BYTES 以内；压不下来就抛 413。
+
+    超线时的削减顺序刻意是“先丢最老的图，再压最大的文本”：图丢了模型能重读
+    文件，日志丢了就真的没了。
+    """
+    cap = PAYLOAD_CAP_BYTES
+    if cap <= 0:
+        return False
+    encoded = _encoded_len(body)
+    if encoded <= cap:
+        return False
+    before = encoded
+    # encoded ≈ 4/3 × body，反推需要削减的 body 字节数
+    need = ((encoded - cap) * 3) // 4 + 4096
+    dropped = 0
+    images = list(_iter_image_parts(body))
+    keep = max(0, PAYLOAD_KEEP_IMAGES)
+    for mi, pi, size in images[:max(0, len(images) - keep)]:
+        if need <= 0:
+            break
+        body["messages"][mi]["content"][pi] = {
+            "type": "text",
+            "text": "[earlier image omitted: %.1f MB - re-read the file if you "
+                    "need it again]" % (size / 1048576.0),
+        }
+        dropped += 1
+        need -= size + 48
+    touched = 0
+    if need > 0:
+        for keep_chars in PAYLOAD_TEXT_KEEP_STEPS:
+            n, saved = _shrink_text_blocks(body, keep_chars, need)
+            touched += n
+            need -= saved
+            if need <= 0:
+                break
+    encoded = _encoded_len(body)
+    log("payload budget: %.1fMB > cap %.0fMB on '%s' -> dropped %d image(s), "
+        "shrank %d text block(s), now %.1fMB"
+        % (before / 1048576.0, cap / 1048576.0, model or "?", dropped,
+           touched, encoded / 1048576.0), level="WARN", tag="chat")
+    if encoded > cap:
+        detail = (PAYLOAD_TOO_LARGE_PREFIX
+                  + "still %.1fMB after dropping %d image(s), over the %.0fMB "
+                    "outbound cap. The upstream gateway aborts such requests "
+                    "(WinError 10053) instead of returning an error, so the "
+                    "request is rejected here. Start a new session, or read "
+                    "fewer/lighter images."
+                  % (encoded / 1048576.0, dropped, cap / 1048576.0))
+        raise urllib.error.HTTPError("payload-budget", 413, "Payload Too Large",
+                                     {}, io.BytesIO(detail.encode("utf-8")))
+    return True
+
+
+def _warn_if_payload_huge(body, images=None):
+    """请求体过大时告警（超过上游约 30MB 硬限会直接被掐连接，不给错误）。"""
+    try:
+        size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return False
+    if PAYLOAD_WARN_BYTES <= 0 or size <= PAYLOAD_WARN_BYTES:
+        return False
+    parts = []
+    for key in ("messages", "chat_context", "image_urls", "tools"):
+        if key in body:
+            try:
+                parts.append("%s=%.1fMB" % (key, len(json.dumps(
+                    body[key], ensure_ascii=False).encode("utf-8")) / 1048576))
+            except Exception:
+                pass
+    n_img = len(images or [])
+    log("payload %.1fMB is close to the upstream ~30MB cap (%s, images=%d) - "
+        "image parts are the usual cause; the gateway aborts the connection "
+        "instead of returning 413"
+        % (size / 1048576, ", ".join(parts) or "?", n_img),
+        level="WARN", tag="chat")
+    return True
+
+
 def build_qoder_body(payload, account, model_key, realm=None):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
@@ -4785,8 +4962,19 @@ def build_qoder_body(payload, account, model_key, realm=None):
     extra["modelConfig"] = dict(mc)
     cc["extra"] = extra
     if images:
-        cc["imageUrls"] = images
-        body["image_urls"] = images
+        # 图片体积陷阱（任务：某会话每轮必 10053/SSL 断连，新会话正常）：
+        # 同一批图会被写进 messages 的 image_url parts、chat_context.imageUrls
+        # 和顶层 image_urls **三份**。24 张图 → body 23.6MB →
+        # qoder_encode 后 31.5MB，超过上游网关约 30MB 的请求体上限，网关
+        # 直接掐连接（不返回 413），客户端只能看到 WinError 10053 /
+        # SSL_ERROR_SYSCALL，重试多少次都一样。
+        # 上游只读 messages 里的结构化 image_url parts，另两份纯浪费 2/3
+        # 体积，所以默认不再填；需要兼容旧行为时设
+        # QD_IMAGE_COMPAT_FIELDS=context（只留 chat_context）或 both（全留）。
+        if IMAGE_COMPAT_FIELDS in ("context", "both"):
+            cc["imageUrls"] = images
+        if IMAGE_COMPAT_FIELDS == "both":
+            body["image_urls"] = images
     body["chat_context"] = cc
 
     # parameters：max_tokens / reasoning_effort
@@ -4826,6 +5014,7 @@ def build_qoder_body(payload, account, model_key, realm=None):
     biz.setdefault("type", "agent")
     biz.setdefault("stage", "start")
     body["business"] = biz
+    _warn_if_payload_huge(body, images)
     return body
 
 
@@ -4951,6 +5140,13 @@ def extract_session_key(headers, payload):
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
 
+# 诊断开关：传输层抖动时把**出问题的上游请求体**落盘，用于排查「某个会话
+# 一直 10053/SSL 断连、新会话却正常」这类内容相关的问题。默认关闭。
+DUMP_TRANSPORT = os.environ.get("QD_DUMP_ON_TRANSPORT", "0").lower() in (
+    "1", "true", "yes", "on")
+DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "transport-dumps")
+
 # issue #38：上游「排队」（403 + isQueued/10605 + retryAfterSeconds）时，
 # 网关**等队列放行后重试**，而不是把排队 JSON 当错误交给客户端——客户端会把
 # 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
@@ -5043,6 +5239,50 @@ def _is_transient_transport(exc):
     return False
 
 
+def _dump_transport_payload(body_obj, model, encoded, exc):
+    """把传输失败的上游请求体写到 transport-dumps/，供内容侧定位（诊断用）。
+
+    输出两份：`*.body.json`（可直接读的上游请求体，含 messages）与
+    `*.index.txt`（每条消息的长度/角色摘要，便于肉眼扫出异常那条）。
+    """
+    try:
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = os.path.join(DUMP_DIR, "transport-%s-%s"
+                            % (stamp, str(model or "model").replace("/", "_")))
+        msgs = body_obj.get("messages") or []
+        meta = {
+            "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model": model,
+            "error": "%s: %s" % (type(exc).__name__, str(exc)[:200]),
+            "messages": len(msgs),
+            "encoded_bytes": len(encoded or ""),
+            "body_keys": sorted(body_obj.keys()),
+        }
+        with open(base + ".body.json", "w", encoding="utf-8") as fh:
+            json.dump({"meta": meta, "body": body_obj}, fh,
+                      ensure_ascii=False)
+        with open(base + ".index.txt", "w", encoding="utf-8") as fh:
+            fh.write("# %s\n" % json.dumps(meta, ensure_ascii=False))
+            for i, m in enumerate(msgs):
+                content = m.get("content")
+                clen = len(content) if isinstance(content, str) else len(
+                    json.dumps(content, ensure_ascii=False) if content else "")
+                extra = [k for k in m.keys()
+                         if k not in ("role", "content")]
+                fh.write("%-4d %-9s content=%-8d keys=%s\n"
+                         % (i, str(m.get("role"))[:9], clen,
+                            ",".join(extra) or "-"))
+        log("diagnostic dump written: %s.body.json (%d msgs)"
+            % (base, len(msgs)), level="WARN", tag="chat")
+    except Exception as exc:                              # 诊断失败不影响主流程
+        try:
+            log("diagnostic dump failed: %s" % exc,
+                level="WARN", tag="chat")
+        except Exception:
+            pass
+
+
 def _friendly_net_error(exc, target=""):
     """把 urlopen/连接类异常翻成可操作的中文（issue #52）。
 
@@ -5103,6 +5343,12 @@ def friendly_upstream_error(code, detail):
                 "请稍后重试。上游详情：%s"
                 % (code_i, detail[:300] or "(无详情)"),
                 "upstream_transient_error")
+    # 本地闸门拒绝（不是上游错误）：请求体超上限，多半是会话里积了太多图片/
+    # 长工具结果。上游对超限 body 是沉默掉线，所以必须由本地提前拒绝。
+    if detail.startswith(PAYLOAD_TOO_LARGE_PREFIX):
+        return ("请求体超过出站上限（防上游 30MB 限制）：%s"
+                % detail[len(PAYLOAD_TOO_LARGE_PREFIX):],
+                "payload_too_large")
     return ("upstream %s: %s" % (code_i, detail)), "upstream_error"
 
 
@@ -5324,6 +5570,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
 
     representative = POOL.pick(realm=realm) if POOL else None
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
+    # 出站体积闸门：超过线就丢最老的图/压文本，实在压不下来直接 413（不重试）
+    enforce_payload_budget(body_obj, model=model)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
         # 与真实出站内容同源，不做二次推算。
@@ -5445,6 +5693,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             except Exception as exc:
                 last_exc = exc
                 detail = ""
+                # 诊断：只在「一次请求的第一次」落盘，避免重试刷屏。
+                if DUMP_TRANSPORT and tries == 0:
+                    _dump_transport_payload(body_obj, model, encoded, exc)
                 # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试；
                 # 若还有官方备用推理域名，优先换域名（对整域故障更有效）。
                 if _is_transient_transport(exc) \
