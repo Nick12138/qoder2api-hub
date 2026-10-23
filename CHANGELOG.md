@@ -9,30 +9,143 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.14（fork：基于上游 v1.6.13）
+
+**🔀 与上游同步**：合并上游 `faed22a`(v1.6.4) → `ea7b5e6`(v1.6.13)，共 14 个提交，覆盖 v1.6.5–v1.6.13。本仓自有的**出站体积闸门**（`enforce_payload_budget`：超 ~30MB 丢最老图/压文本、压不下来直接 413 不重试）随上游 `qoder_proxy.py` 的 640 行变更自动合并，逻辑完整保留。
+
+**版本号说明**：本 fork 上一轮基于上游 v1.6.4 发布为 `1.6.5`（跳过上游已用的 1.6.2/3/4）。本轮上游已推进到 v1.6.13，为避免「fork 1.6.5 反低于上游 1.6.13」造成的版本比较/一键更新混乱，改为**锚定上游最新补丁号 + 叠加本仓改动**：`1.6.13 + 1 = 1.6.14`。
+
+**本轮上游带来的行为变化（升级必读）**
+
+- **排队可见/快速失败 + Responses 回读与兼容 + 面板质量指标 + 测试隔离**（#87）。
+- **跨区 failover 死循环修复**（#83）：`realm=None` 时另一区被解析成同一区 + 无单次守卫，现已加「每请求只切一次」标记。
+- **形态判定对齐** `open_upstream` 的 realm 兜底，恢复 structured 工具历史（#79）；`/agents/models` 按元组解包恢复面板默认模型下拉（#81）。
+- **账号行显示今日签到状态与积分变化**（+/-，带落盘）；账号测试固定使用被点的账号（`only_account`，#86）。
+- **用量洞察独立板块 + 国际版签到修复与提速**（v1.6.9）；未知路径提示重复 `/v1` 前缀 + WARN（#84）。
+- **失败行补齐账号/Key/流式 + `vm_status` 不再谎报来源**（#78）；`start-qoder-proxy.bat` 支持带空格路径（#85）。
+- v1.6.13 仅一处 CI 测试去 flake 的小修。
+
+**🧹 仓库卫生**：上游又把运行时产物 `qoder-proxy.pid` 提交进仓库，本仓再次取消跟踪（`.gitignore`）。
+
+## v1.6.12
+
+**🐛 问题修复**
+
+- **账号测试可能测到别的账号**（#86）：`/accounts/test` 调 `open_upstream()` 时没钉账号，池子会按会话粘性/轮询挑一个——点了 A 号实际测的是 B 号，结果自然对不上。
+  现在 `open_upstream()` 新增 `only_account=` 参数：
+  - 账号测试固定使用被点的那个号（不参与轮换、不走粘性）；
+  - 区域跟随该账号（避免自动路由把请求换到别的区）；
+  - 按「单账号池」处理（冷却压到 3s，不会因为测试失败把整个池子的轮换节奏带偏）；
+  - 成功时清理的是**实际**被测账号的错误状态（`acc.clear_error()`），而不是最初选中的那个。
+  不传该参数时行为与之前逐字节一致（普通请求仍走池）。
+
+**验证**：新增 `tests/_test_issue86_account_test.py`（8 条：源码守卫 + 钉死账号不会被池替换 + 未钉死仍走池）；全量 **67 suites / 1878 checks / 0 failed**。
+
+## v1.6.11
+
+**✨ 新增：账号行显示「今日是否已签到」与「积分变化」**
+
+- **今日签到徽标**：账号名旁直接显示 **✓ 今日已签到**（绿）或 **⏱ 今日未签到**（黄），悬停可看具体日期（`Account.public()` 新增 `checkedInToday` / `lastCheckinDate`）。
+- **积分变化 chip**：积分列在余额后显示最近一次变化——签到 `+100`（绿）/ 消耗 `-35`（红），带弹出动画与时间悬停提示。
+  - 只在数值**真的变化**时更新（`fetch_credits` 对比上一次 `remain_effective`），余额不变不会把旧的 `+100` 冲掉；
+  - 变化值与时间随账号落盘（`lastCreditsDelta` / `lastCreditsDeltaAt`），重启后仍能看到最近一次变化。
+
+**验证**：新增 `tests/_test_account_checkin_status.py`（19 条：今日判定、public 字段、+100/-100/不变三种变化、落盘回读、面板渲染与样式）；全量 **66 suites / 1870 checks / 0 failed**。
+
+## v1.6.10
+
+**🐛 问题修复**
+
+- **启动 bat 无法处理带空格的路径**（#85）：`Start-Process -ArgumentList '%SCRIPT%','--port',...` 的每个元素**不会自动加引号**，路径里有空格时会被拆成多个参数（`C:\Users\My` / `Project\qoder_proxy.py` …），python 直接报找不到文件。
+  现在：
+  - 用 `[char]34` 拼出双引号（避开 bat / PowerShell 双重转义），脚本与 pid 路径都作为**单个带引号参数**传入；
+  - 路径经环境变量（`$env:QD_SCRIPT` 等）传入，避开 `&`、`^` 这类 cmd 元字符；
+  - 日志重定向同样用变量，空格路径不再出错；
+  - `-WindowStyle Hidden` / `-PassThru` / `--pid-file` 语义不变（#50 行为不变）。
+
+  实测：在 `...\my project\qoder proxy\` 这种双层空格目录下启动，桩脚本收到的 argv 为 `['…\qoder proxy\qoder_proxy.py', '--port', '18766', '--pid-file', '…\qoder-proxy.pid']`，参数完整未拆分。
+
+**验证**：新增 `tests/_test_issue85_bat_spaces.py`（9 条：源码守卫 + ASCII-only + 真实带空格目录端到端）；全量 **65 suites / 1851 checks / 0 failed**。
+
+## v1.6.9
+
+**🐛 问题修复（国际版签到不可用 + 无提示）**
+
+- **原生机器身份缺失时 `desktop_headers()` 直接崩**：`native_machine_identity()` 在容器/桥失败时返回 `None`，`ident.get("machineToken")` 抛 `AttributeError`，任务异常而面板**不显示任何原因**。已按空 dict 处理，走 derived 分支。
+- **无原生身份时活动列表可能被隐藏**：新增「最小机器头」兜底——当 `showCampaign=false` 且机器头为 omitted 时，只用 `cosy-machineos` + `cosy-machinehostname` 重试一次（实测该组合仍被服务端视为官方客户端；六头全发才会被过滤）。可用 `QD_INTL_MACHINE_FALLBACK=off` 关闭。
+- **失败原因可见**：签到行在 `showCampaign=false` 时直接写明「缺原生机器身份 / 账号不在定向 / 出口被风控」，并给出安装命令 `python _install_umid.py --platform linux`。
+
+**⚡ 签到速度（实测 12.5s → 1.05s/账号，3 账号整批 3.5s）**
+
+- **legacy 端点不再逐个基址等超时**：`checkin_status`（国际版必然 404）此前 404 后仍换基址重试，单账号耗时 **12.5s**；现在只探主基址（`fallback=False`）、`retries 2 → 1`，并把 404 结果缓存 **6 小时** → 首次 1.05s，之后 0.00s。
+- **签到后刷新并行**：`fetch_credits` + `fetch_plan` 从串行改为并行（省约 1.2s）；去掉无意义的整秒等待（≤0.3s）。
+- 批量并发 3（`QD_CHECKIN_CONCURRENCY`），首个任务立即开始、其余 0–0.3s 错开。
+
+**✨ 新增：用量洞察独立板块**
+
+- 顶部导航新增 **用量洞察**（`#pageInsights`），从网关页拆出；四张**图标卡片**（等价花费 / 积分包 / 最快耗尽账号 / 签到成功率）+ 三张明细表；
+- 数字**滚动动画**、进度条过渡、卡片悬停抬升与图标缩放、表格行 stagger 入场、刷新按钮旋转态，全部尊重 `prefers-reduced-motion`；
+- 只在切到该标签时加载并 30s 轮询（不干扰其他页面）。
+
+**🎨 全局交互打磨**：导航/按钮位移与按压缩放、卡片悬停、表格行过渡、`:focus-visible` 焦点环、`::selection` 配色。
+
+**验证**：新增 `_test_insights_page.py`（19 条）、`_test_checkin_fallback_speed.py`（18 条）、`_test_intl_checkin.py`（13 条）；全量 **64 suites / 1842 checks / 0 failed**。真实 intl 账号实测领取成功（+100 Credits），批量 3 账号 3.54s。
+
+## v1.6.8
+
+**🔍 可诊断性（#84：聚合网关侧报 `do_request_failed`）**
+
+这次没有改业务逻辑——排查结论是**请求根本没到达网关**（附件日志里没有任何 `/v1/chat/completions` 或 `chat:` 行），而 `do_request_failed` 是聚合网关的**传输层**报错（DNS / 连不上 / TLS / 超时）。但这类故障在两边都不好自证，所以补了三处：
+
+- **未知路径返回带提示的 404**：重复的 `/v1` 前缀（`/v1/v1/chat/completions`，base URL 已带 `/v1` 又拼一次）会明确写出「把渠道地址填成 `http://<host>:8790`（不带 /v1）」；普通 404 仍原样回显路径。
+- **未知路径记 WARN**：`404 unknown path: ...` 进日志，一眼分辨「请求到了但路径错」vs「请求根本没到」。
+- **文档补《接入 new-api / one-api 等聚合网关》**：三类常见失败（地址不可达 / 重复 `/v1` / Key 不一致）的对照表，以及在**聚合网关容器内**执行的三条自检命令。
+
+**验证**：新增 `tests/_test_issue84_unknown_path.py`（7 条）；本地起真实网关验证 `/v1/v1/chat/completions` 返回 404 + 提示、普通 404 不受影响；全量 **61 suites / 1792 checks / 0 failed**。
+
+## v1.6.7
+
+**🐛 问题修复（严重）**
+
+- **跨区 failover 死循环，请求永不结束、日志刷屏**（#83）：`_alt_realm_ready()` 用 `"intl" if realm == "cn" else "cn"` 取「另一个区」——而 #76 之后 `realm` 可能是 `None`（未指定出口），`None` 走 else 分支得到 **cn**。于是当请求实际已在 cn 上排队时，网关把「另一区」也算成 cn：**切到 cn → 又排队 → 再切 cn**，无限循环，每个请求都拖到超时，客户端只看到 `upstream stream ended before a completion event`。
+  修法两处：
+  1. `_alt_realm_ready()` 先把 `realm` 解析成**实际出口**（`realm or detect_model_realm(model) or CURRENT_REALM`）再取另一区，且**解析结果与目标相同就返回空**；
+  2. 两条流式路径的跨区 failover 加「每请求只切一次」标记（`_switched71`），切过一次后仍排队就直接转 **429 + Retry-After**，不再反复切。
+
+  修复后的行为：cn 排队 → 若 intl 同模型有就绪账号则切过去**一次**；那边也排队 → 直接 429（带 `retryAfterSeconds`），日志不再刷屏。
+
+**验证**：新增 `tests/_test_issue83_failover_loop.py`（11 条：三区解析、None 解析、独占模型、无就绪账号、探测异常、两处源码守卫）；全量 **60 suites / 1785 checks / 0 failed**。
+
+## v1.6.6
+
+**🐛 问题修复**
+
+- **面板「智能体配置」的默认模型下拉恒为空**（#81，PR #82 by @turmony）：`GET /agents/models` 恒返回 `{"models": []}`。两处缺陷叠加：
+  1. `gateway_models_for_agents()` 把 `fetch_models_merged()` 的返回值当 `dict` 解析，而它返回的是 `(mid, meta, realm)` **元组**，`isinstance(e, dict)` 全判负；
+  2. 带 `realm` 时调用 `fetch_models_merged(realm=...)`，该函数没有这个参数 → `TypeError`，被外层 `except` 吞掉。
+  现在：不带 `realm` 用两区并集，带 `realm` 用 `fetch_models(realm=...)`，再统一经 `model_entry()` 展开（与 `/v1/models` 同源），取 `id` / `context_window` / `max_output`。
+  实测：`/agents/models` **0 → 19** 个模型、`?realm=cn` **0 → 14**；与 `/v1/models` 的 id 集合逐一对齐。
+
+**🧪 测试**
+
+- 新增 `tests/_test_issue81_agents_models.py`（20 条）：三种调用非空、id 与 `/v1/models` 一致且不重复、`context_window`/`max_output` 与 `model_entry` 一致、源码守卫禁止 `fetch_models_merged(<实参>)`。
+
+**验证**：合并后全量 **59 suites / 1774 checks / 0 failed**。
+
 ## v1.6.5
 
-**🔀 与上游同步**：合并上游 v1.6.2 → v1.6.4（6 个提交）。本仓自有的**出站体积闸门**（`enforce_payload_budget`）与图片兼容开关继续保留。
+**🐛 问题修复**
 
-**版本号说明**：本仓上一轮的 `1.6.2` 与上游 `v1.6.2` 同名但内容不同，这里把那一节改名为 `v1.6.2-fork.1`，本轮起补丁号跳过上游已用掉的 1.6.2 / 1.6.3 / 1.6.4，直接取 **1.6.5**，避免一键更新的版本比较与历史阅读混淆。
+- **Anthropic 入口的结构化工具历史恒为 False**（#79，PR #80 by @rongyuio）：#76/PR #77 让三个入口在「未指定出口」时传 `None`，但 `_handle_anthropic` 的**形态决策**也拿到了这个 `None`——而 `structured_tool_history_enabled()` 的 auto 分支要求 `realm == "cn"`，`None` 直接判负，白名单（`deepseek` / `dfmodel` 等）永远不生效。结果是每个 Anthropic 请求都回退文本化，模型重新看到 `LEAK_MARKER` 并按 #49 的方式复述成正文。
+  修法：形态决策用与 `open_upstream` **同源**的兜底（`req_realm or detect_model_realm(model) or CURRENT_REALM`），但**不改动** `req_realm` 本身（它要作为 `target_realm` 传给路由，改了会跳过自动选路）。新增 `tests/_test_issue79_structured_realm.py`（源码守卫 + 真值表 + 金丝雀）。
+- **失败行缺账号 / Key / 流式字段**（PR #78 by @cliffcat）：`record_error` 一直没有 `stream` / `account` / `key_id`，失败行进 `usage.jsonl` 时三项恒为空，面板只能显示「账号=-、Key=历史行未记录」。现在 21 个调用点全部回填；**不传就一个键都不写**（历史行格式不变）；选号失败时 `account` 保持空（不猜）。
+- **`vm_status` 来源谎报**（PR #78）：桥不可用 + 物理机时结论来自本机交叉校验，却被标成 `runtime-info`；反向的「桥可用但无 vmInfo 却写桥不可用」也一并修掉，现在按三种情况分别措辞。
 
-**合并冲突处置（三处，都是同位置追加）**
+**🧪 测试**
 
-- `qoder_proxy.py`：仅 `VERSION` 一行（本仓 1.6.2 / 上游 1.6.4）→ 取 1.6.5。上游 651 行改动全部自动合并，体积闸门与 `MAX_UPSTREAM_BODY_BYTES` 兜底未受影响。
-- `CHANGELOG.md`：两侧都在「版本号规则」后插入新区块 → 上游三段在前，本仓 `v1.6.2-fork.1` 在后。
-- `docs/configuration.md`：本仓的 `QD_DUMP_ON_TRANSPORT` 行与上游新增的「本地 web 工具」小节都追加在同一张表尾 → 行保留、小节随后。
+- **测试不再污染线上用量**（PR #78）：`_test_qoder.py` 的环境变量名写错（`USAGE_DIR` vs `QD_PROXY_USAGE_DIR`）、`bootstrap()` 只隔离账号目录、4 个套件直接 import 绕过 `bootstrap` —— 现在由 `run_all.py` 统一注入用量目录，并在跑前清理 `_acc/usage`。实测跑前后仓库 `usage/usage.jsonl` 的 md5 不变。
 
-**🧹 仓库卫生**
-
-- 上游又把运行时产物 `qoder-proxy.pid` 提交进了仓库，本仓再次取消跟踪。
-
-**上游本轮带来的行为变化（升级必读）**
-
-- **自动换区恢复**（#76）：未显式指定出口的请求不再被入口层钉死当前区，区域独占模型不再提前 400。
-- **身份形态对齐官方桌面端 0.4.8 / qodercli 1.1.75**（#75）：推理 UA 改 `undici`、`cosy-version` 1.1.75、签到链路上报本机主机名、`Cosy-MachineOS` 用真实 `{arch}_{platform}`。身份缓存会**重取一次**；想保持旧指纹可设 `QD_COSY_MACHINE_OS=x86_64_win32`。
-- **用量洞察**（1.6.3）：`/pricing`、`/usage/remaining`、`/accounts/credits/grants`、`/accounts/activity` + 面板区块；费用按 OpenRouter 公布价折算，**不等于官方积分**。
-- **本地 web 工具**（1.6.4）：`web_search` / `web_fetch` 可由网关代跑（DuckDuckGo → Bing → Wikipedia），默认**关闭**，`QD_WEB_TOOLS=on` 或面板开关启用，每轮多消耗一次额度。
-
-**验证**：`python tests/run_all.py` → **57 suites / 1749 checks / 0 failed**（上游 56 suites / 1725 checks + 本仓 `_test_payload_budget.py` 25 条）。
+**验证**：PR #80 独立 57 suites / 1740 checks；PR #78 独立 57 suites / 1737 checks；合并后全量 **58 suites / 1754 checks / 0 failed**。
 
 ## v1.6.4
 
