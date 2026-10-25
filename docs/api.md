@@ -113,6 +113,7 @@
 |---|---|---|
 | `GET /pricing` | 参考价目表（USD / 1M tokens）+ 未定价模型清单 | `qoder_pricing.DEFAULT_PRICES` + `usage/pricing-overrides.json` |
 | `GET /accounts/credits/grants` | 积分包 / 获取记录（面额、剩余、已用） | 最近一次积分快照（**不发上游请求**） |
+| `GET /accounts/credits/usage` | 官方积分消耗：累计 / 单日峰值 / 近 365 天逐日消耗 | 上游 `credits-summary` + `credits-heatmap`（0.4.3 客户端接口），每账号缓存 5 分钟；`?uid=` / `?realm=` 可过滤 |
 | `GET /usage/remaining` | 每账号剩余积分 + 近 24h 消耗 + 预计可用天数 | `usage.jsonl` + 账号积分 |
 | `GET /accounts/activity` | 签到 / 领取动作流水（30 天保留） | `usage/activity.jsonl` |
 

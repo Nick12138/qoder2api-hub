@@ -54,6 +54,7 @@ import qoder_anthropic
 import qoder_catalog
 import qoder_pricing
 import qoder_settings
+import qoder_session_cache
 import qoder_sign
 import qoder_updater
 import qoder_webtools
@@ -62,7 +63,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.14"
+VERSION = "1.7.5"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -524,7 +525,8 @@ def row_matches_realm(row, realm):
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                  gen_ms=None, fp=None, account=None, effort=None,
-                 effort_requested=None, key_id=None, realm_reason=None):
+                 effort_requested=None, key_id=None, realm_reason=None,
+                 session_trace=None):
     """Accumulate stats, append a JSONL row, and persist the summary.
 
     P1-3（推理档位审计 + key 归属）：后三个参数都是**可选**的，旧调用路径不传
@@ -549,6 +551,11 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     row.update(fields)
     if fp:
         row.update(fp)
+    if session_trace:
+        # Never serialize tenant identifiers, client conversation IDs or prompts.
+        for field in ("session_affinity", "upstream_session_id"):
+            if session_trace.get(field):
+                row[field] = session_trace[field]
     if account:
         row["account"] = account
     # P1-3：推理档位审计（请求档位 vs 实际下发档位）与 API key 归属。
@@ -1820,6 +1827,224 @@ def _usage_daily_uncached(days, group, realm, since):
     }
 
 
+
+# ---------------------------------------------------------------------------
+# 统计概览（新版数据看板）：一次扫描产出 KPI / Top 榜 / 热力图 / 缓存 / 24h 曲线
+# ---------------------------------------------------------------------------
+# compute_usage_stats 的形参名是 range（与 /usage/* 的查询参数同名），
+# 会遮蔽内建 range —— 在模块层先留一个别名，函数内一律用它。
+_RNG = range
+
+_PROVIDER_RULES = (
+    ("claude", "Anthropic"), ("anthropic", "Anthropic"), ("haiku", "Anthropic"),
+    ("sonnet", "Anthropic"), ("opus", "Anthropic"),
+    ("gpt", "OpenAI"), ("openai", "OpenAI"), ("o1", "OpenAI"), ("o3", "OpenAI"),
+    ("o4", "OpenAI"), ("davinci", "OpenAI"),
+    ("gemini", "Google"), ("gemma", "Google"), ("palm", "Google"),
+    ("qwen", "通义千问"), ("qwq", "通义千问"), ("tongyi", "通义千问"),
+    ("deepseek", "DeepSeek"), ("dfmodel", "DeepSeek"), ("df-", "DeepSeek"),
+    ("glm", "智谱 GLM"), ("chatglm", "智谱 GLM"),
+    ("kimi", "月之暗面"), ("moonshot", "月之暗面"),
+    ("llama", "Meta"), ("mistral", "Mistral"), ("mixtral", "Mistral"),
+    ("grok", "xAI"), ("doubao", "豆包"), ("ernie", "文心一言"), ("spark", "讯飞星火"),
+    ("hunyuan", "腾讯混元"), ("minimax", "MiniMax"), ("abab", "MiniMax"),
+)
+
+
+def provider_of(model):
+    """模型 -> 上游厂商（面板「提供商」维度用；未知归「其他」）。"""
+    m = str(model or "").lower()
+    for key, name in _PROVIDER_RULES:
+        if key in m:
+            return name
+    return "其他"
+
+
+def _day_key(ts):
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+    except Exception:
+        return ""
+
+
+def compute_usage_stats(range=None, since=None, until=None,
+                        heatmap_days=365, top_n=5):
+    """统计概览页所需的全部数据（单次扫描 usage.jsonl）。
+
+    窗口语义与 /usage/analytics 一致（range_window）：today/week/month/custom/空=全部。
+    热力图固定看最近 heatmap_days 个本地自然日，与窗口无关；窗口只影响 KPI/Top/趋势。
+    """
+    now = time.time()
+    lo, hi = range_window(range, since, until)
+    today_start = _local_midnight()
+    heat_lo = _local_midnight(days_back=max(1, int(heatmap_days)) - 1)
+
+    tot = {"requests": 0, "errors": 0, "tokens": 0,
+           "prompt": 0, "completion": 0, "cached": 0}
+    models = {}       # model -> {"tokens","requests"}
+    accounts = {}     # account -> {"tokens","requests"}
+    providers = {}    # provider -> {"tokens","requests"}
+    heat = {}         # "YYYY-MM-DD" -> tokens
+    act_days = set()  # 窗口内活跃日（本地日期）
+    all_days = set()  # 全年活跃日（连续性计算用）
+    cache_win = {"10m": [0, 0], "1h": [0, 0], "24h": [0, 0], "7d": [0, 0]}
+    hour_cached = [0] * 24
+    hour_prompt = [0] * 24
+    hour_tokens = [0] * 24
+
+    def _bump(bucket, key, tokens, reqs=1):
+        cell = bucket.get(key)
+        if cell is None:
+            cell = bucket[key] = {"tokens": 0, "requests": 0}
+        cell["tokens"] += tokens
+        cell["requests"] += reqs
+
+    if os.path.exists(USAGE_LOG):
+        try:
+            with open(USAGE_LOG, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    at = r.get("at") or 0
+                    try:
+                        at = float(at)
+                    except (TypeError, ValueError):
+                        at = 0.0
+                    prompt = int(r.get("prompt_tokens") or 0)
+                    cached = int(r.get("cached_tokens") or 0)
+                    tokens = int(r.get("total_tokens") or 0)
+                    is_err = bool(r.get("error"))
+                    dkey = _day_key(at)
+                    # 热力图与活跃日：全年范围（不按窗口过滤）
+                    if at >= heat_lo and dkey:
+                        if not is_err and tokens:
+                            heat[dkey] = heat.get(dkey, 0) + tokens
+                        all_days.add(dkey)
+                    # 缓存三窗口：按「现在」回溯（与窗口无关）
+                    if not is_err and prompt > 0:
+                        for _k, _secs in (("10m", 600), ("1h", 3600),
+                                          ("24h", 86400), ("7d", 604800)):
+                            if at >= now - _secs:
+                                cache_win[_k][0] += cached
+                                cache_win[_k][1] += prompt
+                    # 24 小时曲线：按本地整点
+                    if at >= now - 86400 and not is_err:
+                        hour = time.localtime(at).tm_hour
+                        hour_cached[hour] += cached
+                        hour_prompt[hour] += prompt
+                        hour_tokens[hour] += tokens
+                    if not _row_in_window(r, lo, hi):
+                        continue
+                    if dkey:
+                        act_days.add(dkey)
+                    if is_err:
+                        tot["errors"] += 1
+                        continue
+                    tot["requests"] += 1
+                    tot["tokens"] += tokens
+                    tot["prompt"] += prompt
+                    tot["completion"] += int(r.get("completion_tokens") or 0)
+                    tot["cached"] += cached
+                    m = r.get("model") or "(unknown)"
+                    _bump(models, m, tokens)
+                    _bump(accounts, r.get("account") or "(unattributed)", tokens)
+                    _bump(providers, provider_of(m), tokens)
+        except Exception as exc:
+            log("compute_usage_stats failed: %s" % exc, level="WARN", tag="usage")
+
+    _nick = {}
+    try:
+        if POOL:
+            for _a in POOL.accounts:
+                _nick[_a.uid] = _a.nickname or _a.uid[:8]
+    except Exception:
+        _nick = {}
+
+    def _rank(bucket, limit=None):
+        rows = sorted(bucket.items(), key=lambda kv: kv[1]["tokens"], reverse=True)
+        if limit:
+            rows = rows[:limit]
+        total = sum(v["tokens"] for _, v in rows) or 1
+        return [{"name": _nick.get(k) or k, "key": k, "tokens": v["tokens"], "requests": v["requests"],
+                 "share": round(v["tokens"] * 100.0 / total, 2)}
+                for k, v in rows]
+
+    # 连续天数：从今天（或昨天）往回数全年活跃日
+    streak = 0
+    if all_days:
+        probe = time.localtime()
+        # 今天没有请求时从昨天开始数（今天还没过完，不该中断）
+        if _day_key(now) not in all_days:
+            probe = time.localtime(now - 86400)
+        while True:
+            d = time.strftime("%Y-%m-%d", probe)
+            if d not in all_days:
+                break
+            streak += 1
+            probe = time.localtime(time.mktime(probe[:3] + (0, 0, 0, 0, 0, -1)) - 86400)
+
+    top_models = _rank(models)
+    hours = []
+    for i in _RNG(23, -1, -1):
+        ts = now - i * 3600
+        h = time.localtime(ts).tm_hour
+        prompt = hour_prompt[h]
+        cached = hour_cached[h]
+        hours.append({
+            "ts": int(ts),
+            "label": time.strftime("%H:00", time.localtime(ts)),
+            "pct": (round(cached * 100.0 / prompt, 2) if prompt else None),
+            "tokens": hour_tokens[h],
+        })
+
+    cache_rows = []
+    for _k, _label in (("10m", "近 10 分钟"), ("1h", "近 1 小时"),
+                       ("24h", "近 24 小时"), ("7d", "近 7 天")):
+        hit, inp = cache_win[_k]
+        cache_rows.append({"key": _k, "label": _label, "hit": hit, "input": inp,
+                           "pct": (round(hit * 100.0 / inp, 1) if inp else None)})
+
+    heat_days = []
+    start = time.localtime(heat_lo)
+    cursor = time.mktime((start.tm_year, start.tm_mon, start.tm_mday,
+                          0, 0, 0, 0, 0, -1))
+    while cursor <= now:
+        d = _day_key(cursor)
+        heat_days.append({"date": d, "tokens": heat.get(d, 0)})
+        cursor += 86400
+
+    return {
+        "window": {"from": lo, "to": hi, "range": str(range or "all")},
+        "kpi": {
+            "requests": tot["requests"],
+            "success": tot["requests"],
+            "errors": tot["errors"],
+            "success_pct": (round(tot["requests"] * 100.0 /
+                                  (tot["requests"] + tot["errors"]), 2)
+                            if (tot["requests"] + tot["errors"]) else None),
+            "tokens": tot["tokens"],
+            "prompt": tot["prompt"],
+            "completion": tot["completion"],
+            "cached": tot["cached"],
+            "active_days": len(act_days),
+            "streak_days": streak,
+            "top_model": (top_models[0] if top_models else None),
+        },
+        "top_accounts": _rank(accounts, top_n),
+        "top_providers": _rank(providers, top_n),
+        "models": _rank(models, 10),
+        "providers": _rank(providers, 10),
+        "cache": {"windows": cache_rows},
+        "hourly": {"points": hours},
+        "heatmap": {"days": heat_days,
+                     "max": max([d["tokens"] for d in heat_days] or [0])},
+    }
+
 def compute_usage_analytics(range=None, since=None, until=None):
     """Detailed analytics for Token, Cache, and Reasoning metrics page.
 
@@ -2137,6 +2362,72 @@ try:
     AFFINITY_MAX_MSGS = int(os.environ.get("QD_AFFINITY_MAX_MSGS", "0") or 0)
 except (TypeError, ValueError):
     AFFINITY_MAX_MSGS = 0
+
+
+_PREFIX_SESSION_CACHE = None
+_PREFIX_SESSION_CACHE_CONFIG = None
+_PREFIX_SESSION_CACHE_LOCK = threading.Lock()
+
+
+def prefix_session_cache():
+    """Select an opt-in memory/Redis session map; no backend means disabled."""
+    global _PREFIX_SESSION_CACHE, _PREFIX_SESSION_CACHE_CONFIG
+    url = (os.environ.get("QD_SESSION_REDIS_URL") or "").strip()
+    mode = (os.environ.get("QD_SESSION_CACHE") or
+            ("redis" if url else "off")).strip().lower()
+    if mode == "off":
+        return None
+    if mode not in ("memory", "redis"):
+        raise ValueError("QD_SESSION_CACHE must be off, memory or redis")
+    ttl = (os.environ.get("QD_SESSION_CACHE_TTL")
+           or os.environ.get("QD_SESSION_REDIS_TTL") or 3600)
+    timeout = os.environ.get("QD_SESSION_REDIS_TIMEOUT") or 0.4
+    max_entries = os.environ.get("QD_SESSION_CACHE_MAX_ENTRIES") or 4096
+    config = (mode, url, ttl, timeout, max_entries)
+    if _PREFIX_SESSION_CACHE is not None and config == _PREFIX_SESSION_CACHE_CONFIG:
+        return _PREFIX_SESSION_CACHE
+    with _PREFIX_SESSION_CACHE_LOCK:
+        if _PREFIX_SESSION_CACHE is None or config != _PREFIX_SESSION_CACHE_CONFIG:
+            secret = qoder_settings.panel_session_secret(ACCOUNTS_DIR)
+            if mode == "memory":
+                cache = qoder_session_cache.MemorySessionCache(
+                    ttl=ttl, max_entries=max_entries, hash_secret=secret)
+            else:
+                cache = qoder_session_cache.PrefixSessionCache(
+                    url, ttl=ttl, timeout=timeout, hash_secret=secret)
+            _PREFIX_SESSION_CACHE = cache
+            _PREFIX_SESSION_CACHE_CONFIG = config
+    return _PREFIX_SESSION_CACHE
+
+
+def assign_prefix_session(body, account, model_key, client_session_key=None,
+                          usage_ctx=None):
+    """Choose a cache-affine ID only within the selected upstream account."""
+    # Always reset: a preceding failed account may already have acquired an ID.
+    body["session_id"] = str(uuid.uuid4())
+    if usage_ctx is not None:
+        usage_ctx["session_affinity"] = "random"
+    try:
+        cache = prefix_session_cache()
+        if cache is not None:
+            matched = cache.resolve(
+                body.get("messages"), account.uid, account.realm, model_key,
+                client_session_key=client_session_key,
+                tenant_scope=(usage_ctx or {}).get("tenant_scope", ""),
+                context={"tools": body.get("tools"),
+                         "parameters": body.get("parameters"),
+                         "agent_id": body.get("agent_id")})
+            if matched:
+                body["session_id"] = matched
+                if usage_ctx is not None:
+                    usage_ctx["session_affinity"] = cache.backend + "-prefix"
+    except Exception as exc:
+        # Optional optimization: cache failure must not break inference or
+        # log a connection URL, password, message, or raw exception details.
+        log("prefix session cache unavailable (%s); random session used"
+            % type(exc).__name__, level="WARN", tag="chat")
+    if usage_ctx is not None:
+        usage_ctx["upstream_session_id"] = body["session_id"]
 
 
 def derive_affinity_key(messages):
@@ -3168,6 +3459,50 @@ def apply_update_now(tag=None):
     """执行更新（阻塞）；成功后调用方负责触发重启。"""
     with _UPDATE_LOCK:
         return qoder_updater.apply_update(APP_ROOT, tag=tag)
+
+# 进程级启动时间：/health 回给外部（issue #89：判断「跑的是不是新版本」）
+STARTED_AT = time.time()
+
+
+def _pid_alive(pid):
+    """PID 是否还活着（跨平台；权限不足视为活着）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def classify_existing_instance(existing, pid_alive=None):
+    """判断 /health 的应答者属于哪种情况（issue #89）。
+
+    返回 "foreign" / "healthy" / "stale" / "none"：
+      · foreign  —— 同端口上是别的服务（service 字段不对或没有 accounts）
+      · healthy  —— 真的是一个活着的 qd-proxy
+      · stale    —— 应答来自**正在退出**的旧实例（pid 已不存在），不该拦启动
+      · none     —— 没人应答
+    """
+    if not isinstance(existing, dict):
+        return "none"
+    if existing.get("service") not in (None, "qoder-proxy") \
+            or "accounts" not in existing:
+        return "foreign"
+    alive = pid_alive or _pid_alive
+    pid = existing.get("pid")
+    if pid and not alive(pid):
+        return "stale"
+    return "healthy"
+
 
 # ---------------------------------------------------------------------------
 # 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
@@ -6193,7 +6528,7 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
 
 
 def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
-                                  holder, account):
+                                  holder, account, usage_ctx=None):
     """非流式：流内瞬时错误信封 / 传输抖动 -> 重开上游重新聚合。
 
     仅用于客户端尚未收到任何字节的非流式路径。返回 (chat_obj, account)：
@@ -6203,6 +6538,7 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
       - 传输层瞬时错误（TLS EOF 等）同样触发重开
     传入的 resp 由调用方的 with/finally 关闭；本函数只负责关闭重开的新连接。
     """
+    reopen_options = {"usage_ctx": usage_ctx} if usage_ctx is not None else {}
     cur = resp
     try:
         # issue #51 补充：排队可能要多等几轮（仅排队时 should_retry 才允许）
@@ -6223,7 +6559,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 time.sleep(_envelope_retry_wait(exc, attempt + 1))
                 try:
                     new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
+                        payload, session_key=session_key, target_realm=realm,
+                        **reopen_options)
                 except Exception as reopen_exc:
                     log("reopen after envelope error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -6246,7 +6583,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 time.sleep(attempt + 1)
                 try:
                     new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
+                        payload, session_key=session_key, target_realm=realm,
+                        **reopen_options)
                 except Exception as reopen_exc:
                     log("reopen after transport error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -6321,15 +6659,31 @@ def _team_min_gap():
 
 
 def _is_team_account(account):
-    """团队/企业账号判定：userType 或额度快照里有组织共享池（issue #56）。"""
+    """团队/企业账号判定（issue #56 / #90）。
+
+    口径与 Account.is_team() 同源：组织字段（OAuth 登录即带）> userType > 共享额度池。
+    issue #90 起因：userinfo 根本不返回 user_type，企业号只靠 userType 判定会漏，
+    结果团队闸门/共享额度都不生效。
+    """
     if account is None:
         return False
+    probe = getattr(account, "is_team", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except Exception:
+            pass
     ut = str(getattr(account, "user_type", "") or "").lower()
     if "team" in ut or "enterprise" in ut:
         return True
+    if str(getattr(account, "organization_id", "") or "").strip() \
+            or str(getattr(account, "organization_name", "") or "").strip():
+        return True
     cred = getattr(account, "credits", None)
     if isinstance(cred, dict):
-        if isinstance(cred.get("shared"), dict) and cred["shared"].get("size"):
+        shared = cred.get("shared")
+        if isinstance(shared, dict) and (shared.get("size")
+                                        or shared.get("unlimited")):
             return True
         for pkg in cred.get("packages") or []:
             if isinstance(pkg, dict) and pkg.get("name") == "共享额度":
@@ -6610,6 +6964,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             level="WARN", tag="chat")
         raise PayloadTooLarge(_size, MAX_UPSTREAM_BODY_BYTES)
 
+    client_session_key = session_key
     if not session_key:
         session_key = derive_affinity_key(body_obj.get("messages"))
         if session_key and AFFINITY_DEBUG:
@@ -6663,6 +7018,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # 身份相关的 aliyun_user_type 需要真实账号
         body_obj["aliyun_user_type"] = account.user_type or \
             qoder_sign.DEFAULT_USER_TYPE
+        # Resolve only after choosing the actual account, before signing.
+        assign_prefix_session(body_obj, account, model_key,
+                              client_session_key=client_session_key,
+                              usage_ctx=usage_ctx)
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
@@ -8802,6 +9161,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "qoder-proxy",
                 "version": VERSION,
+                "pid": os.getpid(),
+                "started_at": int(STARTED_AT),
+                "started_iso": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(STARTED_AT)),
                 "realm": CURRENT_REALM,
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_ready() if POOL else 0,
@@ -8912,6 +9275,56 @@ class Handler(BaseHTTPRequestHandler):
                 "unpriced": _unpriced,
                 "note": "参考 OpenRouter 公布价折算，仅用于估算，不能用于结算；"
                         "可在 usage/pricing-overrides.json 覆盖单价",
+            })
+        if path == "/accounts/credits/usage":
+            # 官方积分消耗（0.4.3 客户端新增接口）：summary + 近 365 天逐日消耗
+            # ?uid= 只看单个账号；不传则汇总全部账号（realm 可选过滤）
+            if not self._authorized():
+                return
+            want_uid = (query.get("uid") or [None])[0]
+            want_realm = (query.get("realm") or [None])[0]
+            rows = []
+            daily_sum = {}
+            total = peak = 0.0
+            peak_date = ""
+            for acc in (POOL.accounts if POOL else []):
+                if want_uid and acc.uid != want_uid:
+                    continue
+                if want_realm and getattr(acc, "realm", "") != want_realm:
+                    continue
+                try:
+                    cu = acc.fetch_credit_usage()
+                except Exception as exc:
+                    cu = {"ok": False, "error": str(exc)[:120]}
+                rows.append({
+                    "uid": acc.uid,
+                    "nickname": acc.nickname or acc.uid[:8],
+                    "realm": getattr(acc, "realm", ""),
+                    "ok": bool(cu.get("ok")),
+                    "total": cu.get("total") or 0,
+                    "peak": cu.get("peak") or 0,
+                    "peak_date": cu.get("peak_date") or "",
+                    "error": cu.get("error") or "",
+                })
+                if not cu.get("ok"):
+                    continue
+                total += float(cu.get("total") or 0)
+                if float(cu.get("peak") or 0) >= peak:
+                    peak = float(cu.get("peak") or 0)
+                    peak_date = cu.get("peak_date") or peak_date
+                for item in (cu.get("daily") or []):
+                    d = item.get("date") or ""
+                    if d:
+                        daily_sum[d] = daily_sum.get(d, 0.0) + float(item.get("value") or 0)
+            daily = [{"date": k, "value": round(v, 4)}
+                     for k, v in sorted(daily_sum.items())]
+            return self._json(200, {
+                "accounts": rows,
+                "total": round(total, 4),
+                "peak": round(peak, 4),
+                "peak_date": peak_date,
+                "daily": daily,
+                "unit": "credits",
             })
         if path == "/accounts/credits/grants":
             # 积分获取历史（跟进 wb）：只读内存里的积分快照，不发上游请求
@@ -9113,6 +9526,13 @@ class Handler(BaseHTTPRequestHandler):
             # 输出与改动前逐字节一致；语义见 range_window）
             req_range, req_since, req_until = range_query(query)
             return self._json(200, compute_usage_analytics(
+                range=req_range, since=req_since, until=req_until))
+        if path == "/usage/stats":
+            # 统计概览（新版数据看板）：KPI / Top 榜 / 热力图 / 缓存 / 24h 曲线一次取回
+            if not self._authorized():
+                return
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, compute_usage_stats(
                 range=req_range, since=req_since, until=req_until))
         if path == "/usage/by-account":
             if not self._authorized():
@@ -9925,7 +10345,7 @@ class Handler(BaseHTTPRequestHandler):
         # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
         account = None
         try:
-            usage_ctx = {}
+            usage_ctx = {"tenant_scope": self._key_id_for_usage()}
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -9942,6 +10362,40 @@ class Handler(BaseHTTPRequestHandler):
                          account=account.uid if account else None,
                          key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
+        except UpstreamQueued as exc:
+            # issue #99：这个入口以前没接 #87 的排队分支，10605 排队会零等待
+            # 直接 503 且丢掉 Retry-After。此刻**还没写过任何字节**
+            # （_sse_begin 尚未调用），所以流内等待不存在「重复 message_start」
+            # 的顾虑——docstring 里那条能力差异只适用于 aggregate_stream 之后。
+            _msg, _et = friendly_upstream_error(503, exc.detail)
+            if not want_stream or queue_mode() != "visible":
+                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+            self._sse_begin()
+            _q0 = time.time()
+
+            def _emit_q(kind, info):
+                info = dict(info or {})
+                info["model"] = model
+                if kind == "queue":
+                    self._queue_notice("anthropic", info)
+                else:
+                    self._queue_error_frame(
+                        "anthropic", info.get("message") or _msg,
+                        info.get("waited_seconds") or int(time.time() - _q0),
+                        info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)
+
+            _got = visible_queue_acquire(
+                exc,
+                lambda: open_upstream(chat_req, session_key=session_key,
+                                      target_realm=req_realm,
+                                      usage_ctx=usage_ctx),
+                _emit_q, started=_q0)
+            if _got is None:
+                self._sse_end()
+                return
+            upstream, account, _ = _got
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等本地拦下的错误——明确状态码，
             # 不进账号冷却/重试链路（上游根本没收到这个请求）。
@@ -9952,7 +10406,9 @@ class Handler(BaseHTTPRequestHandler):
                          account=account.uid if account else None,
                          key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
-            return self._error(_code, _msg, _etype)
+            # issue #99：即使走到兜底分支，也把上游建议的重试间隔透传出去
+            return self._error(_code, _msg, _etype,
+                               retry_after=getattr(exc, "retry_after", None))
         except urllib.error.HTTPError as exc:
             detail = getattr(exc, "qoder_detail", "")
             if not detail:
@@ -10009,7 +10465,8 @@ class Handler(BaseHTTPRequestHandler):
                                  effort=usage_ctx.get("effort"),
                                  effort_requested=usage_ctx.get("effort_requested"),
                                  key_id=self._key_id_for_usage(),
-                                 realm_reason=usage_ctx.get("realm_reason", ""))
+                                 realm_reason=usage_ctx.get("realm_reason", ""),
+                                 session_trace=usage_ctx)
                     return
                 except UpstreamStatus as exc:
                     # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
@@ -10037,12 +10494,13 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             session_trace=usage_ctx)
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, usage_ctx=usage_ctx)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -10067,7 +10525,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
             return self._json(200, result)
 
     def _handle_web_tools(self, path, payload, names):
@@ -10088,16 +10547,18 @@ class Handler(BaseHTTPRequestHandler):
         chat_req["tools"] = rewrite_web_tools(chat_req.get("tools") or [], names)
         chat_req["stream"] = False
         model = str(chat_req.get("model") or "")
+        session_key = extract_session_key(self.headers, payload)
         messages = list(chat_req.get("messages") or [])
         realm = self._request_realm()
-        usage_ctx = {}
+        usage_ctx = {"tenant_scope": self._key_id_for_usage()}
         obj = None
         rounds = 0
         for _ in range(max(1, WEB_TOOLS_MAX_ROUNDS)):
             req = dict(chat_req, messages=messages)
             try:
                 resp, account, _ = open_upstream(
-                    req, target_realm=realm, usage_ctx=usage_ctx)
+                    req, target_realm=realm, usage_ctx=usage_ctx,
+                    session_key=session_key)
             except RateLimited as exc:
                 return self._rate_limited(exc)
             except urllib.error.HTTPError as exc:
@@ -10173,7 +10634,7 @@ class Handler(BaseHTTPRequestHandler):
         account = None
         try:
             req_realm = self._request_realm()
-            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            usage_ctx = {"tenant_scope": self._key_id_for_usage()}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -10309,7 +10770,8 @@ class Handler(BaseHTTPRequestHandler):
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
                                          key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""))
+                                         realm_reason=usage_ctx.get("realm_reason", ""),
+                                         session_trace=usage_ctx)
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -10408,12 +10870,13 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             session_trace=usage_ctx)
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, usage_ctx=usage_ctx)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -10438,7 +10901,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
             return self._json(200, result)
 
     def do_POST(self):
@@ -10638,7 +11102,7 @@ class Handler(BaseHTTPRequestHandler):
         account = None
         try:
             req_realm = self._request_realm()
-            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            usage_ctx = {"tenant_scope": self._key_id_for_usage()}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(model, req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -10764,7 +11228,8 @@ class Handler(BaseHTTPRequestHandler):
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
                                          key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""))
+                                         realm_reason=usage_ctx.get("realm_reason", ""),
+                                         session_trace=usage_ctx)
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -10863,12 +11328,13 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             session_trace=usage_ctx)
                 return
             try:
                 result, account = aggregate_with_envelope_retry(
                     upstream, payload, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, usage_ctx=usage_ctx)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -10902,7 +11368,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
             return self._json(200, result)
 
 
@@ -10974,43 +11441,62 @@ def main():
 
     # 拒绝启动第二份：Windows 上 SO_REUSEADDR 会让两个 socket 绑同一端口，
     # 连接被静默分流，极难诊断。
-    try:
-        probe = urllib.request.urlopen(
-            "http://%s:%d/health"
-            % ("127.0.0.1" if args.host == "0.0.0.0" else args.host, args.port),
-            timeout=2)
-        existing = json.loads(probe.read().decode("utf-8"))
-    except Exception:
-        existing = None   # 没人应答 /health —— 让下面的 bind 决定
-    if isinstance(existing, dict):
-        # 只有我们的 /health 带账号池字段（"accounts"）。其它服务可能占用
-        # 同端口也应答 /health JSON（例如 wb-proxy / mimo-api-proxy）。
-        foreign = existing.get("service") not in (None, "qoder-proxy") \
-            or "accounts" not in existing
-        if foreign:
-            who = existing.get("service") or "an unknown HTTP service"
-            print()
-            print("  [ERROR] port %d is already taken by another program: %s"
-                  % (args.port, who))
-            print("          qd-proxy itself is NOT running - nothing was "
-                  "started.")
-            print()
-            print("  Fix: start qoder-proxy on a different port, e.g.")
-            print("          %s %d" % (START_SCRIPT, args.port + 1))
-            print("          python qoder_proxy.py --port %d" % (args.port + 1))
-            print()
-            for cmd in port_owner_hint(args.port):
-                print("  Check who owns the port:  %s" % cmd)
-            print()
-            raise SystemExit(1)
+    #
+    # issue #89：只问「有没有人应答 /health」会把「刚收到 SIGTERM、还在收尾的旧
+    # 实例」误判成健康双开——升级（kill 后立刻 start）时几乎必撞。现在按 应答者
+    # 的 pid 是否还活着 分类，并对「端口尚未释放」做有限重试。
+    def _probe_health(timeout=2.0):
+        try:
+            url = "http://%s:%d/health" % (
+                "127.0.0.1" if args.host == "0.0.0.0" else args.host,
+                args.port)
+            with urllib.request.urlopen(url, timeout=timeout) as probe:
+                return json.loads(probe.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    existing = None
+    for _attempt in range(3):
+        existing = _probe_health()
+        if classify_existing_instance(existing) != "stale":
+            break
+        print()
+        print("  [WARN] %d 端口仍有人在应答 /health，但它的进程已经退出"
+              % args.port)
+        print("         （旧实例正在释放端口）。继续启动新实例：等待 %d/3 ..."
+              % (_attempt + 1))
+        sys.stdout.flush()
+        time.sleep(1.2)
+        existing = None
+    _kind = classify_existing_instance(existing)
+    if _kind == "foreign":
+        who = (existing or {}).get("service") or "an unknown HTTP service"
+        print()
+        print("  [ERROR] port %d is already taken by another program: %s"
+              % (args.port, who))
+        print("          qd-proxy itself is NOT running - nothing was "
+              "started.")
+        print()
+        print("  Fix: start qoder-proxy on a different port, e.g.")
+        print("          %s %d" % (START_SCRIPT, args.port + 1))
+        print("          python qoder_proxy.py --port %d" % (args.port + 1))
+        print()
+        for cmd in port_owner_hint(args.port):
+            print("  Check who owns the port:  %s" % cmd)
+        print()
+        raise SystemExit(1)
+    if _kind == "healthy":
         print()
         print("  [已有一个反代在 %d 端口运行，无需重复启动]" % args.port)
+        print("  PID: %s · 版本: %s · 启动于: %s"
+              % (existing.get("pid") or "?", existing.get("version") or "?",
+                 existing.get("started_iso") or "?"))
         print("  账号: %s @ %s" % (existing.get("uid", "?"),
                                    existing.get("domain", "?")))
         print("  看板: http://127.0.0.1:%d/" % args.port)
         print()
-        print("  如果要重启: 先把原来那个窗口关掉（或结束 python 进程），"
-              "再运行本程序。")
+        print("  如果要重启: 用 stop 脚本（Windows: stop-qoder-proxy.bat /"
+              " Linux·macOS: ./stop-qoder-proxy.sh），再启动本程序。")
         print()
         return
 
@@ -11183,23 +11669,41 @@ def main():
         print()
         sys.stdout.flush()
 
-    try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
-    except OSError as exc:
-        # bind 前探测与 bind 之间端口被抢，或被不答 /health 的程序占着
-        print()
-        print("  [ERROR] failed to listen on %s:%d - %s"
-              % (args.host, args.port, exc))
-        print("          the port is reserved or held by another program;")
-        print("          qd-proxy did NOT start.")
-        print()
-        print("  Fix: stop the program holding the port, or pick another "
-              "port:")
-        for cmd in port_owner_hint(args.port):
-            print("          %s" % cmd)
-        print("          %s %d" % (START_SCRIPT, args.port + 1))
-        print()
-        raise SystemExit(1)
+    # issue #89：旧实例刚退出时端口可能还没释放——有限重试，并在此期间复查
+    # /health：如果是**健康**实例起来了，就按「已在运行」退出而不是报错。
+    server = None
+    for _attempt in range(3):
+        try:
+            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            break
+        except OSError as exc:
+            _kind2 = classify_existing_instance(_probe_health(1.0))
+            if _kind2 == "healthy":
+                print()
+                print("  [已有一个反代在 %d 端口运行，无需重复启动]" % args.port)
+                print("  看板: http://127.0.0.1:%d/" % args.port)
+                print()
+                return
+            if _attempt < 2:
+                print("  [WARN] bind %s:%d 失败（%s）——端口可能仍在释放，"
+                      "重试 %d/3 ..." % (args.host, args.port, exc, _attempt + 1))
+                sys.stdout.flush()
+                time.sleep(1.5)
+                continue
+            print()
+            print("  [ERROR] failed to listen on %s:%d - %s"
+                  % (args.host, args.port, exc))
+            print("          the port is reserved or held by another program")
+            print("          (possibly a qd-proxy instance that is still shutting down);")
+            print("          qd-proxy did NOT start.")
+            print()
+            print("  Fix: wait a second and retry, stop the program holding the")
+            print("       port, or pick another port:")
+            for cmd in port_owner_hint(args.port):
+                print("          %s" % cmd)
+            print("          %s %d" % (START_SCRIPT, args.port + 1))
+            print()
+            raise SystemExit(1)
     log("listening  : http://%s:%d/v1  (api key: %s)"
         % (args.host, args.port, "on" if API_KEY else "off"))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))
